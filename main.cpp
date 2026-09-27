@@ -1,10 +1,17 @@
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <grp.h>
 #include <iostream>
+#include <pwd.h>
 #include <queue>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 enum class NodeType { USER, GROUP, FILE_NODE, DIRECTORY };
 
@@ -158,68 +165,100 @@ public:
     }
     std::cout << "-----------------------" << std::endl;
   }
+  void exportToDOT(const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out.is_open()) return;
+    out << "digraph PermissionGraph {\n";
+    out << "  rankdir=LR;\n";
+    for (const auto& pair : nodes) {
+        const Node& n = pair.second;
+        std::string shape = "ellipse";
+        if (n.type == NodeType::GROUP) shape = "diamond";
+        else if (n.type == NodeType::FILE_NODE) shape = "box";
+        else if (n.type == NodeType::DIRECTORY) shape = "folder";
+        out << "  \"" << n.id << "\" [label=\"" << n.name << "\", shape=" << shape << "];\n";
+    }
+    for (const auto& pair : adjList) {
+        const std::string& src = pair.first;
+        for (const Edge& edge : pair.second) {
+            std::string label;
+            std::string color = "black";
+            switch(edge.type) {
+                case EdgeType::MEMBER_OF: label = "MEMBER_OF"; color = "blue"; break;
+                case EdgeType::OWNS: label = "OWNS"; color = "green"; break;
+                case EdgeType::CAN_READ: label = "CAN_READ"; color = "gray"; break;
+                case EdgeType::CAN_WRITE: label = "CAN_WRITE"; color = "red"; break;
+                case EdgeType::CAN_EXECUTE: label = "CAN_EXECUTE"; color = "orange"; break;
+            }
+            out << "  \"" << src << "\" -> \"" << edge.targetNodeId << "\" [label=\"" << label << "\", color=\"" << color << "\", fontsize=10];\n";
+        }
+    }
+    out << "}\n";
+    out.close();
+  }
 };
 
-void populateDummyEnvironment(PermissionGraph &graph) {
-  graph.addNode("u:guest", "Guest User", NodeType::USER);
-  graph.addNode("u:intern", "Intern", NodeType::USER);
-  graph.addNode("u:www-data", "Web Service", NodeType::USER);
-  graph.addNode("u:admin", "System Admin", NodeType::USER);
+void scanRealDirectory(const std::string &directoryPath,
+                       PermissionGraph &graph) {
+  std::cout << "[+] Scanning real directory: " << directoryPath << std::endl;
 
-  graph.addNode("g:staff", "Staff Group", NodeType::GROUP);
-  graph.addNode("g:dev", "Developers Group", NodeType::GROUP);
-  graph.addNode("g:docker", "Docker Group", NodeType::GROUP);
-  graph.addNode("g:wheel", "Sudoers (Wheel)", NodeType::GROUP);
+  std::string anyoneId = "u:ANYONE";
+  graph.addNode(anyoneId, "World/Others", NodeType::USER);
 
-  graph.addNode("f:public_html", "/var/www/html", NodeType::DIRECTORY);
-  graph.addNode("f:backup.sh", "/opt/scripts/backup.sh", NodeType::FILE_NODE);
-  graph.addNode("f:docker_sock", "/var/run/docker.sock", NodeType::FILE_NODE);
-  graph.addNode("f:shadow", "/etc/shadow", NodeType::FILE_NODE);
-  graph.addNode("f:ssh_keys", "/root/.ssh/authorized_keys",
-                NodeType::FILE_NODE);
+  for (const auto &entry : fs::recursive_directory_iterator(directoryPath)) {
+    std::string filePath = entry.path().string();
 
-  graph.addEdge("u:guest", "g:staff", EdgeType::MEMBER_OF);
-  graph.addEdge("u:intern", "g:dev", EdgeType::MEMBER_OF);
-  graph.addEdge("u:www-data", "g:staff", EdgeType::MEMBER_OF);
-  graph.addEdge("u:admin", "g:wheel", EdgeType::MEMBER_OF);
-  graph.addEdge("u:admin", "g:dev", EdgeType::MEMBER_OF);
+    NodeType nType =
+        entry.is_directory() ? NodeType::DIRECTORY : NodeType::FILE_NODE;
+    graph.addNode("f:" + filePath, filePath, nType);
 
-  graph.addEdge("g:dev", "g:docker",
-                EdgeType::MEMBER_OF); // Devs can use docker
+    struct stat fileStat;
+    if (stat(filePath.c_str(), &fileStat) == 0) {
 
-  graph.addEdge("g:staff", "f:public_html", EdgeType::CAN_READ);
-  graph.addEdge("u:www-data", "f:public_html", EdgeType::OWNS);
-  graph.addEdge("g:dev", "f:backup.sh", EdgeType::CAN_WRITE);
+      struct passwd *pw = getpwuid(fileStat.st_uid);
+      std::string ownerName =
+          pw ? pw->pw_name : std::to_string(fileStat.st_uid);
+      std::string ownerId = "u:" + ownerName;
 
-  graph.addEdge("g:docker", "f:docker_sock", EdgeType::CAN_WRITE);
-  graph.addEdge("f:docker_sock", "f:shadow", EdgeType::CAN_WRITE);
-  graph.addEdge("f:docker_sock", "f:ssh_keys", EdgeType::CAN_WRITE);
+      graph.addNode(ownerId, ownerName, NodeType::USER);
+      graph.addEdge(ownerId, "f:" + filePath, EdgeType::OWNS);
 
-  graph.addEdge("g:wheel", "f:shadow", EdgeType::CAN_READ);
-  graph.addEdge("g:wheel", "f:ssh_keys", EdgeType::CAN_WRITE);
+      struct group *gr = getgrgid(fileStat.st_gid);
+      std::string groupName =
+          gr ? gr->gr_name : std::to_string(fileStat.st_gid);
+      std::string groupId = "g:" + groupName;
+
+      graph.addNode(groupId, groupName, NodeType::GROUP);
+
+      fs::perms p = entry.status().permissions();
+
+      if ((p & fs::perms::owner_read) != fs::perms::none)
+        graph.addEdge(ownerId, "f:" + filePath, EdgeType::CAN_READ);
+      if ((p & fs::perms::owner_write) != fs::perms::none)
+        graph.addEdge(ownerId, "f:" + filePath, EdgeType::CAN_WRITE);
+      if ((p & fs::perms::owner_exec) != fs::perms::none)
+        graph.addEdge(ownerId, "f:" + filePath, EdgeType::CAN_EXECUTE);
+
+      if ((p & fs::perms::group_read) != fs::perms::none)
+        graph.addEdge(groupId, "f:" + filePath, EdgeType::CAN_READ);
+      if ((p & fs::perms::group_write) != fs::perms::none)
+        graph.addEdge(groupId, "f:" + filePath, EdgeType::CAN_WRITE);
+      if ((p & fs::perms::group_exec) != fs::perms::none)
+        graph.addEdge(groupId, "f:" + filePath, EdgeType::CAN_EXECUTE);
+
+      if ((p & fs::perms::others_read) != fs::perms::none)
+        graph.addEdge(anyoneId, "f:" + filePath, EdgeType::CAN_READ);
+      if ((p & fs::perms::others_write) != fs::perms::none)
+        graph.addEdge(anyoneId, "f:" + filePath, EdgeType::CAN_WRITE);
+      if ((p & fs::perms::others_exec) != fs::perms::none)
+        graph.addEdge(anyoneId, "f:" + filePath, EdgeType::CAN_EXECUTE);
+    }
+  }
 }
 
 int main() {
   PermissionGraph graph;
-  populateDummyEnvironment(graph);
-
-  std::cout << "\n=== BLAST RADIUS ANALYSIS ===" << std::endl;
-  graph.calculateBlastRadius("u:intern");
-
-  std::cout << "\n=== ATTACK PATH ANALYSIS ===" << std::endl;
-  std::vector<std::string> path = graph.findAttackPath("u:intern", "f:shadow");
-
-  if (!path.empty()) {
-    std::cout << "CRITICAL VULNERABILITY FOUND! Attack path ("
-              << path.size() - 1 << " hops):\n";
-    for (size_t i = 0; i < path.size(); ++i) {
-      std::cout << path[i];
-      if (i != path.size() - 1) {
-        std::cout << " -> ";
-      }
-    }
-    std::cout << "\n\n";
-  }
-
+  scanRealDirectory(".", graph);
+  graph.exportToDOT("/home/dew/projects/spl_proj/outbreak_map.dot");
   return 0;
 }
