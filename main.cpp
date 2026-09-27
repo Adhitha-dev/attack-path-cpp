@@ -196,6 +196,96 @@ public:
     out << "}\n";
     out.close();
   }
+
+  bool isEmpty() const {
+    return adjList.empty();
+  }
+
+  void saveSnapshot(const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out.is_open()) return;
+    for (const auto& pair : nodes) {
+        out << "N," << pair.second.id << "," << pair.second.name << "," << static_cast<int>(pair.second.type) << "\n";
+    }
+    for (const auto& pair : adjList) {
+        for (const Edge& edge : pair.second) {
+            out << "E," << pair.first << "," << edge.targetNodeId << "," << static_cast<int>(edge.type) << "\n";
+        }
+    }
+    out.close();
+  }
+
+  void loadSnapshot(const std::string& filename) {
+    std::ifstream in(filename);
+    if (!in.is_open()) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line[0] == 'N') {
+            size_t p1 = line.find(',', 2);
+            size_t p2 = line.rfind(',');
+            if (p1 == std::string::npos || p2 == std::string::npos) continue;
+            std::string id = line.substr(2, p1 - 2);
+            std::string name = line.substr(p1 + 1, p2 - p1 - 1);
+            int type = std::stoi(line.substr(p2 + 1));
+            addNode(id, name, static_cast<NodeType>(type));
+        } else if (line[0] == 'E') {
+            size_t p1 = line.find(',', 2);
+            size_t p2 = line.rfind(',');
+            if (p1 == std::string::npos || p2 == std::string::npos) continue;
+            std::string src = line.substr(2, p1 - 2);
+            std::string tgt = line.substr(p1 + 1, p2 - p1 - 1);
+            int type = std::stoi(line.substr(p2 + 1));
+            addEdge(src, tgt, static_cast<EdgeType>(type));
+        }
+    }
+    in.close();
+  }
+
+  void compareWith(const PermissionGraph& oldGraph) {
+    std::cout << "\n=== SECURITY DELTA REPORT ===\n";
+    bool changes = false;
+    for (const auto& pair : adjList) {
+        const std::string& src = pair.first;
+        for (const Edge& newEdge : pair.second) {
+            bool found = false;
+            if (oldGraph.adjList.find(src) != oldGraph.adjList.end()) {
+                for (const Edge& oldEdge : oldGraph.adjList.at(src)) {
+                    if (oldEdge.targetNodeId == newEdge.targetNodeId && oldEdge.type == newEdge.type) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                std::string threatLevel = "LOW";
+                std::string reason = "";
+                
+                if (src == "u:ANYONE" && newEdge.type == EdgeType::CAN_WRITE) {
+                    threatLevel = "CRITICAL";
+                    reason = "World-Writable! Any rogue user or guest can maliciously modify this file.";
+                }
+                else if (src == "u:ANYONE" && newEdge.type == EdgeType::CAN_EXECUTE && newEdge.targetNodeId.find(".sh") != std::string::npos) {
+                    threatLevel = "HIGH";
+                    reason = "World-Executable Script! Anyone can run this script, which could lead to arbitrary code execution.";
+                }
+                else if (src == "u:root" && newEdge.type == EdgeType::OWNS) {
+                    threatLevel = "MEDIUM";
+                    reason = "Root took ownership. Ensure this wasn't an unintended privilege escalation.";
+                }
+
+                if (threatLevel != "LOW") {
+                    std::cout << "[ " << threatLevel << " THREAT ]\n";
+                    std::cout << " -> Entity : " << src << "\n";
+                    std::cout << " -> Target : " << newEdge.targetNodeId << "\n";
+                    std::cout << " -> Risk   : " << reason << "\n\n";
+                    changes = true;
+                }
+            }
+        }
+    }
+    if (!changes) std::cout << "[-] No dangerous permission changes detected.\n";
+  }
 };
 
 void scanRealDirectory(const std::string &directoryPath,
@@ -205,7 +295,19 @@ void scanRealDirectory(const std::string &directoryPath,
   std::string anyoneId = "u:ANYONE";
   graph.addNode(anyoneId, "World/Others", NodeType::USER);
 
-  for (const auto &entry : fs::recursive_directory_iterator(directoryPath)) {
+  auto it = fs::recursive_directory_iterator(directoryPath);
+  for (auto end = fs::recursive_directory_iterator(); it != end; ++it) {
+    const auto &entry = *it;
+    std::string filename = entry.path().filename().string();
+
+    // Ignore hidden files and directories (anything starting with '.')
+    if (!filename.empty() && filename[0] == '.') {
+        if (entry.is_directory()) {
+            it.disable_recursion_pending(); // Skip traversing into this folder completely
+        }
+        continue;
+    }
+
     std::string filePath = entry.path().string();
 
     NodeType nType =
@@ -257,8 +359,22 @@ void scanRealDirectory(const std::string &directoryPath,
 }
 
 int main() {
-  PermissionGraph graph;
-  scanRealDirectory(".", graph);
-  graph.exportToDOT("/home/dew/projects/spl_proj/outbreak_map.dot");
+  std::string snapshotFile = "/home/dew/projects/spl_proj/snapshot.csv";
+  
+  PermissionGraph oldGraph;
+  oldGraph.loadSnapshot(snapshotFile);
+  
+  PermissionGraph newGraph;
+  scanRealDirectory(".", newGraph);
+  
+  if (!oldGraph.isEmpty()) {
+      newGraph.compareWith(oldGraph);
+  } else {
+      std::cout << "\n[i] No baseline found. Creating new baseline snapshot.\n";
+  }
+  
+  newGraph.saveSnapshot(snapshotFile);
+  newGraph.exportToDOT("/home/dew/projects/spl_proj/outbreak_map.dot");
+  
   return 0;
 }
